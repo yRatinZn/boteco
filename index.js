@@ -5,44 +5,26 @@ const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
 
-let onlinePlayers = [];
-
+// rota principal só pra teste
 app.get("/", (req, res) => {
   res.json({
     status: "online",
-    message: "API MTA funcionando no Render",
-    count: onlinePlayers.length,
-    players: onlinePlayers
+    message: "Webhook do bot de vendas funcionando"
   });
 });
 
-app.get("/mta/players", (req, res) => {
-  res.json({
-    count: onlinePlayers.length,
-    players: onlinePlayers
-  });
-});
+// webhook do Mercado Pago
+app.post("/webhook", (req, res) => {
+  console.log("Webhook recebido do Mercado Pago:");
+  console.log(req.body);
 
-app.post("/mta/players", (req, res) => {
-  const { players } = req.body;
+  // aqui depois você pode tratar o pagamento
+  // exemplo: verificar se foi aprovado
+  // e mandar cargo no Discord, enviar mensagem, etc
 
-  if (!Array.isArray(players)) {
-    return res.status(400).json({
-      error: "Envie no formato: { \"players\": [\"Nome1\", \"Nome2\"] }"
-    });
-  }
-
-  onlinePlayers = players;
-
-  console.log("Players atualizados:", onlinePlayers);
-
-  res.json({
-    success: true,
-    count: onlinePlayers.length,
-    players: onlinePlayers
-  });
+  res.sendStatus(200);
 });
 
 app.listen(PORT, () => {
-  console.log(`API rodando na porta ${PORT}`);
+  console.log(`Servidor rodando na porta ${PORT}`);
 });
