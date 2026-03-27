@@ -1,7 +1,6 @@
 {
-  "name": "render-bot-mta-api",
+  "name": "bot-vendas-webhook",
   "version": "1.0.0",
-  "description": "API simples para Render receber lista de players do MTA",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
