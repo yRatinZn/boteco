@@ -12,6 +12,7 @@ const {
   Client,
   EmbedBuilder,
   GatewayIntentBits,
+  MessageFlags,
   ModalBuilder,
   Partials,
   PermissionsBitField,
@@ -34,7 +35,8 @@ const WEBHOOKS = {
   close: 'https://discordapp.com/api/webhooks/1486465846233661630/oVUAvt8O2kmlEUvtj8VJEidgfoqz45JJvzt1QS-oNIRDUI5cOWdGwaU2GQgcocLCRTSo',
   delete: 'https://discordapp.com/api/webhooks/1486466618182864986/bBVq_YhFT7sO7E5HS13FTMa3f7iJbbQKyH_U-3hRA9KjAGl1OhiKF9-U_6crUSCBq5_V',
   orderCreate: 'https://discordapp.com/api/webhooks/1487186665825894401/aTqll9VEaH0KRH7IeVLriCemDJWOrnv0OSM7ti5BRDTbrwG7xlQeP91HGu-LW_zoof9D',
-  orderDelete: 'https://discordapp.com/api/webhooks/1487186566194659532/QfGKIT4PXXp7ydjgYHyYptKfyat5MTJugjgBVGqXuJWvWAEpbuX9wKpX6-t-y8Xw_lno'
+  orderDelete: 'https://discordapp.com/api/webhooks/1487186566194659532/QfGKIT4PXXp7ydjgYHyYptKfyat5MTJugjgBVGqXuJWvWAEpbuX9wKpX6-t-y8Xw_lno',
+  saleConfirm: 'https://discordapp.com/api/webhooks/1487186523680936016/gpaPeX7fW-JNF6KO2kwb0fpvvv2A7s3H2ZB1D9BQhDWkvtMT3gIGweNbp6059gYwpOQu'
 };
 const DEFAULT_HELP_COMMANDS = ['help', 'ticket', 'vendamenu', 'vendabotao', 'listar', 'addestoque'];
 const HELP_COMMAND_NAMES =
@@ -94,7 +96,7 @@ const ensureProductTable = (rawName) =>
   new Promise((resolve, reject) => {
     const tableName = sanitizeTableName(rawName);
     if (!tableName) {
-      reject(new Error('Nome da tabela invlido.'));
+      reject(new Error('Nome da tabela inválido.'));
       return;
     }
 
@@ -252,12 +254,26 @@ const deleteStockRows = (tableName, ids) =>
   });
 
 const reserveStockItems = async (tableName, quantity) => {
-  if (quantity <= 0) return [];
-  const rows = await fetchStockRows(tableName, quantity);
-  if (!rows.length) return [];
+  const sanitizedTable = sanitizeTableName(tableName);
+  if (!sanitizedTable || quantity <= 0) {
+    return { tableName: sanitizedTable, rows: [], ids: [] };
+  }
+  const rows = await fetchStockRows(sanitizedTable, quantity);
+  if (!rows.length) {
+    return { tableName: sanitizedTable, rows: [], ids: [] };
+  }
   const ids = rows.map((row) => row.id);
-  await deleteStockRows(tableName, ids);
-  return rows;
+  await deleteStockRows(sanitizedTable, ids);
+  return { tableName: sanitizedTable, rows, ids };
+};
+
+const finalizeDeliveredProducts = async (tableName, ids) => {
+  if (!tableName || !ids?.length) return;
+  try {
+    await deleteStockRows(tableName, ids);
+  } catch (error) {
+    console.error('Erro removendo produtos entregues do banco', error);
+  }
 };
 
 const ensurePanelMetadataTable = () =>
@@ -386,7 +402,7 @@ const getPriceForTable = (tableName) => {
 const buildStockEmbed = (tableName, stock, price) =>
   new EmbedBuilder()
     .setTitle(`Estoque: ${tableName}`)
-    .setDescription(`?? Preo: ${price || ''}\n?? Estoque: ${stock}\nTabela (DB Name): \`${tableName}\`\nUse os botes abaixo para adicionar ou limpar o estoque.`)
+    .setDescription(`💸 | Preço: ${price || ''}\n📦 | Estoque: ${stock}\nTabela (DB Name): \`${tableName}\`\nUse os Botões abaixo para adicionar ou limpar o estoque.`)
     .setColor('DarkGreen');
 
 
@@ -457,6 +473,60 @@ const priceOverrides = new Map();
 const stockMessagesByTable = new Map();
 const orderSessions = new Map();
 const paymentReferences = new Map();
+const PENDING_PAYMENTS_FILE = path.join(DATA_DIR, 'pending_payments.json');
+
+const serializePaymentEntry = (entry) => {
+  if (!entry?.state) return null;
+  return {
+    state: entry.state,
+    processed: Boolean(entry.processed),
+    processing: Boolean(entry.processing)
+  };
+};
+
+const savePendingPayments = () => {
+  try {
+    const payload = {};
+    for (const [reference, entry] of paymentReferences.entries()) {
+      const serialized = serializePaymentEntry(entry);
+      if (serialized) payload[reference] = serialized;
+    }
+    fs.writeFileSync(PENDING_PAYMENTS_FILE, JSON.stringify(payload, null, 2), 'utf8');
+  } catch (error) {
+    console.error('Erro ao salvar pagamentos pendentes', error);
+  }
+};
+
+const loadPendingPayments = () => {
+  try {
+    if (!fs.existsSync(PENDING_PAYMENTS_FILE)) return;
+    const raw = fs.readFileSync(PENDING_PAYMENTS_FILE, 'utf8');
+    if (!raw.trim()) return;
+    const parsed = JSON.parse(raw);
+    for (const [reference, entry] of Object.entries(parsed || {})) {
+      if (entry?.state && !entry.processed) {
+        paymentReferences.set(reference, { state: entry.state, processed: false, processing: false });
+      }
+    }
+    if (paymentReferences.size) {
+      console.log(`[MP WEBHOOK] ${paymentReferences.size} pagamento(s) pendente(s) restaurado(s) do disco.`);
+    }
+  } catch (error) {
+    console.error('Erro ao carregar pagamentos pendentes', error);
+  }
+};
+
+const setPendingPayment = (reference, state) => {
+  paymentReferences.set(reference, { state, processed: false, processing: false });
+  savePendingPayments();
+};
+
+const removePendingPayment = (reference) => {
+  paymentReferences.delete(reference);
+  savePendingPayments();
+};
+
+loadPendingPayments();
 
 const normalizeColor = (value) => {
   if (!value) return null;
@@ -469,10 +539,21 @@ const normalizeColor = (value) => {
 
 const respondEphemeral = async (interaction, content) => {
   if (!interaction) return null;
-  if (interaction.deferred || interaction.replied) {
-    return interaction.followUp({ content, ephemeral: true });
+  const options = { content, flags: MessageFlags.Ephemeral };
+  const sendReply = () => interaction.reply(options);
+  const sendFollowUp = () => interaction.followUp(options);
+  try {
+    if (interaction.acknowledged || interaction.deferred || interaction.replied) {
+      return await sendFollowUp();
+    }
+    return await sendReply();
+  } catch (error) {
+    const errorCode = error?.code || error?.rawError?.code;
+    if (errorCode === 40060 || errorCode === 10062) {
+      return null;
+    }
+    throw error;
   }
-  return interaction.reply({ content, ephemeral: true });
 };
 
 const awaitUserResponse = async (interaction, prompt) => {
@@ -514,8 +595,8 @@ const updateStockMessage = async (channel, tableName, stock, price) => {
 
 const createTicketControlRows = () => [
   new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('ticket:title').setLabel('Ttulo').setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId('ticket:description').setLabel('Descrio').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('ticket:title').setLabel('Título').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('ticket:description').setLabel('Descrição').setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId('ticket:image').setLabel('Imagem').setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId('ticket:supports').setLabel('Suportes').setStyle(ButtonStyle.Primary)
   ),
@@ -527,13 +608,13 @@ const createTicketControlRows = () => [
 
 const createVendaControlRows = () => [
   new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('vendamenu:title').setLabel('Ttulo').setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId('vendamenu:description').setLabel('Descrio').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('vendamenu:title').setLabel('Título').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('vendamenu:description').setLabel('Descrição').setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId('vendamenu:image').setLabel('Imagem').setStyle(ButtonStyle.Primary)
   ),
   new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('vendamenu:products').setLabel('Produtos').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('vendamenu:price').setLabel('Preo').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('vendamenu:price').setLabel('Preço').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId('vendamenu:color').setLabel('Cor da embed').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId('vendamenu:dbname').setLabel('DB Name').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId('vendamenu:send').setLabel('Enviar painel').setStyle(ButtonStyle.Success)
@@ -542,12 +623,12 @@ const createVendaControlRows = () => [
 
 const createVendaBotaoControlRows = () => [
   new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('vendabotao:title').setLabel('Ttulo').setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId('vendabotao:description').setLabel('Descrio').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('vendabotao:title').setLabel('Título').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('vendabotao:description').setLabel('Descrição').setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId('vendabotao:image').setLabel('Imagem').setStyle(ButtonStyle.Primary)
   ),
   new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('vendabotao:price').setLabel('Preo').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('vendabotao:price').setLabel('Preço').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId('vendabotao:color').setLabel('Cor da embed').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId('vendabotao:dbname').setLabel('DB Name').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId('vendabotao:send').setLabel('Enviar painel').setStyle(ButtonStyle.Success)
@@ -563,7 +644,7 @@ const buildVendaEmbed = (session, stock = 0) => {
   const descriptionPart = session.description?.trim() || '';
   const embed = new EmbedBuilder()
     .setTitle(session.title || 'Painel de venda')
-    .setDescription(`${descriptionPart}\n\n?? Preo: ${session.price || ''}\n?? Estoque: ${stock}`)
+    .setDescription(`${descriptionPart}\n\n💸 | Preço: ${session.price || ''}\n📦 | Estoque: ${stock}`)
     .setColor(session.color || '#5865F2');
 
   if (session.imageURL) {
@@ -609,7 +690,7 @@ const resolveSessionTableStock = async (session) => {
     const stock = await getStockCount(tableKey);
     return { tableKey, stock };
   } catch (error) {
-    console.error('Erro ao resolver estoque da sesso', error);
+    console.error('Erro ao resolver estoque da sessão', error);
     return { tableKey, stock: 0 };
   }
 };
@@ -644,9 +725,9 @@ const buildOrderEmbed = (state) => {
     .setDescription(state.description || 'Revise os detalhes antes de confirmar.')
     .setColor(state.color || '#5865F2')
     .addFields(
-      { name: 'Preo unitrio', value: state.priceLabel || '', inline: true },
+      { name: 'Preço unitário', value: state.priceLabel || '', inline: true },
       { name: 'Quantidade escolhida', value: String(quantity), inline: true },
-      { name: 'Estoque disponvel', value: String(stock), inline: true },
+      { name: 'Estoque disponível', value: String(stock), inline: true },
       { name: 'Total aproximado', value: formatCurrencyValue(total), inline: true },
       { name: 'Cupom aplicado', value: state.coupon || 'Nenhum', inline: true },
       { name: 'Tabela (DB Name)', value: state.tableName || '', inline: true }
@@ -668,14 +749,14 @@ const calculateOrderTotal = (state) => {
 const buildPaymentSummaryEmbed = (state) => {
   const total = calculateOrderTotal(state);
   const embed = new EmbedBuilder()
-    .setTitle('Confirmao de pagamento')
+    .setTitle('Confirmação de pagamento')
     .setDescription('Revise a quantidade e o total antes de gerar o PIX.')
     .setColor('#2d8c00')
     .addFields(
       { name: 'Produto', value: state.title || 'Pedido', inline: true },
       { name: 'Quantidade', value: String(Number.isFinite(state.quantity) ? state.quantity : 1), inline: true },
       { name: 'Total', value: formatCurrencyValue(total), inline: true },
-      { name: 'Preo unitrio', value: state.priceLabel || '', inline: true }
+      { name: 'Preço unitário', value: state.priceLabel || '', inline: true }
     );
   if (state.coupon) {
     embed.addFields({ name: 'Cupom aplicado', value: state.coupon, inline: true });
@@ -776,7 +857,7 @@ const hasClosePermission = (member) =>
 
 const createSupportChannel = async (interaction, supportLabel) => {
   const guild = interaction.guild;
-  if (!guild) throw new Error('Guild no encontrada.');
+  if (!guild) throw new Error('Guild não encontrada.');
   const creatorPart = sanitizeChannelName(interaction.user.username) || 'usuario';
   const channelName = `sup-${creatorPart}-${interaction.user.id}`.slice(0, 90);
   const existing = guild.channels.cache.find(
@@ -836,7 +917,7 @@ const createSupportChannel = async (interaction, supportLabel) => {
     .setColor('Gold')
     .addFields(
       {
-        name: 'Instrues',
+        name: 'Instruções',
         value: 'Mantenha a conversa por aqui, no abra mltiplos tickets e aguarde pela equipe.',
         inline: false
       },
@@ -892,7 +973,7 @@ const sendPaymentConfirmationWebhookNotification = async (payload) => {
       body: JSON.stringify(payload)
     });
   } catch (error) {
-    console.error('Falha ao enviar webhook de confirmao de pagamento', error);
+    console.error('Falha ao enviar webhook de Confirmação de pagamento', error);
   }
 };
 
@@ -927,40 +1008,52 @@ const processPaymentConfirmation = async (paymentInfo) => {
   if (!paymentInfo) return;
   if (paymentInfo.status !== 'approved') return;
   const reference = paymentInfo.external_reference;
+  console.log('[MP WEBHOOK] external_reference recebido:', reference);
   if (!reference) return;
   const entry = paymentReferences.get(reference);
-  if (!entry || entry.processing) return;
+  if (!entry) {
+    console.log(`[MP WEBHOOK] referência ${reference} não encontrada entre pendências.`);
+    return;
+  }
+  if (entry.processing) return;
   entry.processing = true;
   try {
     const state = entry.state;
     const total = calculateOrderTotal(state);
-    const reservedItems = await reserveStockItems(state.tableName, state.quantity);
+    const { tableName: sanitizedTableName, rows: reservedItems, ids: reservedIds } = await reserveStockItems(
+      state.tableName,
+      state.quantity
+    );
+    if (sanitizedTableName) {
+      state.tableName = sanitizedTableName;
+    }
     const itemList = reservedItems.map((row) => row.item || `item-${row.id}`);
     state.paymentProcessed = true;
     entry.processed = true;
-    paymentReferences.delete(reference);
+    removePendingPayment(reference);
 
     const dmEmbed = new EmbedBuilder()
-      .setTitle('Pagamento confirmado')
-      .setDescription('Recebemos a confirmao do PIX e reservamos seus itens.')
+      .setTitle('VgN | Compra aprovada')
+      .setDescription('Recebemos a Confirmação do PIX e reservamos seus itens.')
       .setColor('#2d8c00')
       .addFields(
-        { name: 'Produto', value: state.title || 'Pedido', inline: true },
-        { name: 'Quantidade', value: String(state.quantity), inline: true },
-        { name: 'Valor total', value: formatCurrencyValue(total), inline: true },
-        { name: 'Itens retirados', value: itemList.length ? itemList.join(', ') : 'Nenhum item listado', inline: false },
-        { name: 'Tabela', value: state.tableName || '', inline: true }
+        { name: '🛒 Produto', value: state.title || 'Pedido', inline: true },
+        { name: '✏️ Quantidade', value: String(state.quantity), inline: true },
+        { name: '💸 Valor total', value: formatCurrencyValue(total), inline: true },
+        { name: '🔔 Seus produtos', value: itemList.length ? itemList.join(', ') : 'Nenhum item listado', inline: false },
       );
     try {
       const buyer = await client.users.fetch(state.userId);
       await buyer.send({ embeds: [dmEmbed] });
+      console.log(`[MP WEBHOOK] DM enviada para ${state.userId}.`);
     } catch (error) {
-      console.error('Erro ao enviar DM de confirmao', error);
+      console.error('Erro ao enviar DM de Confirmação', error);
     }
 
     try {
       const orderChannel = await client.channels.fetch(state.channelId).catch(() => null);
       if (orderChannel?.isTextBased?.()) {
+        console.log(`[MP WEBHOOK] enviando confirmação no canal ${state.channelId}.`);
         await orderChannel.send({
           content: `<@${state.userId}> pagamento confirmado!`,
           embeds: [
@@ -986,8 +1079,25 @@ const processPaymentConfirmation = async (paymentInfo) => {
       state.stock = remainingStock;
       await updateOrderMessageEmbed(state);
     } catch (error) {
-      console.error('Erro ao atualizar embed de estoque aps confirmao', error);
+      console.error('Erro ao atualizar embed de estoque após Confirmação', error);
     }
+
+    await finalizeDeliveredProducts(state.tableName, reservedIds);
+
+    await sendWebhookNotification(WEBHOOKS.saleConfirm, {
+      title: 'Venda concluída',
+      description: `${state.userTag || 'Cliente'} recebeu o pedido.`,
+      color: 0x2d8c00,
+      fields: [
+        { name: 'Produto', value: state.title || 'Pedido', inline: true },
+        { name: 'Quantidade', value: String(state.quantity), inline: true },
+        { name: 'Total', value: formatCurrencyValue(total) || 'R$ 0,00', inline: true },
+        { name: 'Tabela', value: state.tableName || '—', inline: true },
+        { name: 'Itens removidos', value: itemList.length ? itemList.join(', ') : 'Nenhum item listado', inline: false },
+        { name: 'Canal', value: state.channelId ? `<#${state.channelId}>` : '—', inline: true }
+      ],
+      timestamp: new Date().toISOString()
+    });
 
     await sendPaymentConfirmationWebhookNotification({
       buyerId: state.userId,
@@ -1000,7 +1110,7 @@ const processPaymentConfirmation = async (paymentInfo) => {
       tableName: state.tableName
     });
   } catch (error) {
-    console.error('Erro ao processar confirmao de pagamento', error);
+    console.error('Erro ao processar Confirmação de pagamento', error);
   }
 };
 
@@ -1116,7 +1226,7 @@ const createMercadoPagoPix = async ({ amount, description, reference, user }) =>
   const result = await response.json().catch(() => ({}));
   console.log('[MP PIX] resposta da criação:', JSON.stringify(result || {}, null, 2));
   if (!response.ok) {
-    const message = result?.message || 'No foi possvel gerar o PIX.';
+    const message = result?.message || 'Não foi possvel gerar o PIX.';
     throw new Error(message);
   }
   const transactionData = result.point_of_interaction?.transaction_data;
@@ -1135,7 +1245,7 @@ const createMercadoPagoPix = async ({ amount, description, reference, user }) =>
 const sendTicketSummary = async (channel, session) => {
   const embed = new EmbedBuilder()
     .setTitle(session.title || 'Ticket')
-    .setDescription(session.description || 'Sem descrio definida.')
+    .setDescription(session.description || 'Sem descrição definida.')
     .setColor(session.color || '#5865F2');
 
   if (session.imageURL) {
@@ -1181,7 +1291,7 @@ const commands = {
     }
   },
   ticket: {
-    description: 'Inicia a criao interativa de um ticket.',
+    description: 'Inicia a criação interativa de um ticket.',
     async execute(message) {
       ticketSessions.set(message.author.id, {
         title: null,
@@ -1194,7 +1304,7 @@ const commands = {
       const embed = new EmbedBuilder()
         .setTitle('Configurao do ticket')
         .setDescription(
-          'Use os botes abaixo para definir ttulo, descrio, imagem, suportes e cor. Clique em "Enviar ticket" quando finalizar.'
+          'Use os Botões abaixo para definir título, descrição, imagem, suportes e cor. Clique em "Enviar ticket" quando finalizar.'
         )
         .setColor('DarkBlue');
 
@@ -1221,7 +1331,7 @@ const commands = {
       const embed = new EmbedBuilder()
         .setTitle('Configurao de venda')
         .setDescription(
-          'Use os botes para adicionar ttulo, descrio, imagem, produtos, preo, cor e nome da tabela. Clique em "Enviar painel" ao terminar.'
+          'Use os Botões para adicionar título, descrição, imagem, produtos, preço, cor e nome da tabela. Clique em "Enviar painel" ao terminar.'
         )
         .setColor('Purple');
 
@@ -1247,7 +1357,7 @@ const commands = {
       const embed = new EmbedBuilder()
         .setTitle('Configurao de venda (boto)')
         .setDescription(
-          'Defina ttulo, descrio, imagem, preo, cor e nome da tabela. Clique em "Enviar painel" quando terminar.'
+          'Defina título, descrição, imagem, preço, cor e nome da tabela. Clique em "Enviar painel" quando terminar.'
         )
         .setColor('Purple');
 
@@ -1259,11 +1369,11 @@ const commands = {
     }
   },
   listar: {
-    description: 'Exibe um catlogo de exemplo para vendas.',
+    description: 'Exibe um catálogo de exemplo para vendas.',
     async execute(message) {
       await message.reply({
         content:
-          'Catlogo de exemplo:\n1. Camiseta PRO - R$ 120\n2. Curso Intensivo - R$ 350\nAbra um ticket para pedir apoio.',
+          'Catálogo de exemplo:\n1. Camiseta PRO - R$ 120\n2. Curso Intensivo - R$ 350\nAbra um ticket para pedir apoio.',
         allowedMentions: { repliedUser: false }
       });
     }
@@ -1308,7 +1418,7 @@ const commands = {
       } catch (error) {
         console.error('Erro buscando tabelas de produtos', error);
         await message.reply({
-          content: 'No foi possvel carregar os produtos neste momento.',
+          content: 'Não foi possível carregar os produtos neste momento.',
           allowedMentions: { repliedUser: false }
         });
       }
@@ -1329,7 +1439,7 @@ client.on('messageCreate', async (message) => {
   const member = message.member;
   if (!member?.roles.cache.has(COMMAND_ROLE_ID)) {
     await message.reply({
-      content: `Voc precisa ter o cargo <@&${COMMAND_ROLE_ID}> para usar comandos.`,
+      content: `Vocêê precisa ter o cargo <@&${COMMAND_ROLE_ID}> para usar comandos.`,
       allowedMentions: { repliedUser: false }
     });
     return;
@@ -1369,7 +1479,7 @@ client.on('interactionCreate', async (interaction) => {
         }
         const sanitizedName = sanitizeTableName(tableName);
         if (!sanitizedName) {
-          await respondEphemeral(interaction, 'Nome invlido do produto selecionado.');
+          await respondEphemeral(interaction, 'Nome inválido do produto selecionado.');
           return;
         }
         try {
@@ -1381,7 +1491,7 @@ client.on('interactionCreate', async (interaction) => {
               .setStyle(ButtonStyle.Success),
             new ButtonBuilder()
               .setCustomId(`stock:price:${sanitizedName}`)
-              .setLabel('Alterar preo')
+              .setLabel('Alterar preço')
               .setStyle(ButtonStyle.Primary),
             new ButtonBuilder()
               .setCustomId(`stock:clear:${sanitizedName}`)
@@ -1398,14 +1508,14 @@ client.on('interactionCreate', async (interaction) => {
             embeds: [embed],
             components: [row],
             allowedMentions: { repliedUser: false },
-            fetchReply: true
+            withResponse: true
           });
           if (replyMessage?.id) {
             stockMessagesByTable.set(sanitizedName, replyMessage.id);
           }
         } catch (error) {
           console.error('Erro ao montar embed de estoque', error);
-          await respondEphemeral(interaction, 'No foi possvel carregar o produto selecionado.');
+          await respondEphemeral(interaction, 'Não foi possvel carregar o produto selecionado.');
         }
         return;
       }
@@ -1422,7 +1532,7 @@ client.on('interactionCreate', async (interaction) => {
             channels.push(channel);
           } catch (error) {
             console.error('Erro criando canal de suporte', error);
-            await respondEphemeral(interaction, 'No foi possvel criar o canal de suporte. Verifique permisses e categoria.');
+            await respondEphemeral(interaction, 'Não foi possvel criar o canal de suporte. Verifique permisses e categoria.');
             return;
           }
         }
@@ -1435,7 +1545,7 @@ client.on('interactionCreate', async (interaction) => {
       if (interaction.customId === 'order_qty_modal') {
         const state = orderSessions.get(interaction.channelId);
         if (!state) {
-          await respondEphemeral(interaction, 'Sesso de pedido no encontrada.');
+          await respondEphemeral(interaction, 'sessão de pedido no encontrada.');
           return;
         }
         const requestedValue = interaction.fields.getTextInputValue('order_qty_input');
@@ -1448,19 +1558,19 @@ client.on('interactionCreate', async (interaction) => {
         if (stock <= 0) {
           state.quantity = 0;
           await updateOrderMessageEmbed(state);
-          await interaction.reply({ content: 'Estoque indisponvel.', ephemeral: true });
+          await interaction.reply({ content: 'Estoque indisponível.', flags: MessageFlags.Ephemeral });
           return;
         }
         state.quantity = Math.min(stock, requested);
         await updateOrderMessageEmbed(state);
-        await interaction.reply({ content: `Quantidade definida para ${state.quantity}.`, ephemeral: true });
+        await interaction.reply({ content: `Quantidade definida para ${state.quantity}.`, flags: MessageFlags.Ephemeral });
         return;
       }
 
       if (interaction.customId === 'order_coupon_modal') {
         const state = orderSessions.get(interaction.channelId);
         if (!state) {
-          await respondEphemeral(interaction, 'Sesso de pedido no encontrada.');
+          await respondEphemeral(interaction, 'sessão de pedido no encontrada.');
           return;
         }
         const couponCode = interaction.fields.getTextInputValue('order_coupon_input')?.trim();
@@ -1468,7 +1578,7 @@ client.on('interactionCreate', async (interaction) => {
         await updateOrderMessageEmbed(state);
         await interaction.reply({
           content: couponCode ? `Cupom definido: ${couponCode}` : 'Cupom limpo.',
-          ephemeral: true
+          flags: MessageFlags.Ephemeral
         });
         return;
       }
@@ -1479,14 +1589,14 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.customId.startsWith('vendamenu:')) {
       const member = interaction.member;
       if (!member?.roles.cache.has(COMMAND_ROLE_ID)) {
-        await respondEphemeral(interaction, `Voc precisa do cargo <@&${COMMAND_ROLE_ID}> para configurar o painel.`);
+        await respondEphemeral(interaction, `Você precisa do cargo <@&${COMMAND_ROLE_ID}> para configurar o painel.`);
         return;
       }
 
       const action = interaction.customId.split(':')[1];
       const session = saleSessions.get(interaction.user.id);
       if (!session) {
-        await respondEphemeral(interaction, 'Nenhuma sesso encontrada. Inicie o comando novamente.');
+        await respondEphemeral(interaction, 'Nenhuma sessão encontrada. Inicie o comando novamente.');
         return;
       }
 
@@ -1496,21 +1606,21 @@ client.on('interactionCreate', async (interaction) => {
       };
 
       if (action === 'title') {
-        const texto = await promptForValue('Defina o ttulo do painel.');
+        const texto = await promptForValue('Defina o título do painel.');
         if (texto) {
           session.title = texto;
           saleSessions.set(interaction.user.id, session);
-          await respondEphemeral(interaction, 'Ttulo atualizado.');
+          await respondEphemeral(interaction, 'Título atualizado.');
         }
         return;
       }
 
       if (action === 'description') {
-        const texto = await promptForValue('Defina a descrio do painel.');
+        const texto = await promptForValue('Defina a descrição do painel.');
         if (texto) {
           session.description = texto;
           saleSessions.set(interaction.user.id, session);
-          await respondEphemeral(interaction, 'Descrio atualizada.');
+          await respondEphemeral(interaction, 'Descrição atualizada.');
         }
         return;
       }
@@ -1546,11 +1656,11 @@ client.on('interactionCreate', async (interaction) => {
       }
 
       if (action === 'price') {
-        const texto = await promptForValue('Informe o preo que ser exibido (ex: R$ 120).');
+        const texto = await promptForValue('Informe o preço que ser exibido (ex: R$ 120).');
         if (texto) {
           session.price = texto;
           saleSessions.set(interaction.user.id, session);
-          await respondEphemeral(interaction, 'Preo atualizado.');
+          await respondEphemeral(interaction, 'Preço atualizado.');
         }
         return;
       }
@@ -1564,7 +1674,7 @@ client.on('interactionCreate', async (interaction) => {
             saleSessions.set(interaction.user.id, session);
             await respondEphemeral(interaction, 'Cor atualizada.');
           } else {
-            await respondEphemeral(interaction, 'Cor invlida. Use #rrggbb ou um nome vlido.');
+            await respondEphemeral(interaction, 'Cor inválida. Use #rrggbb ou um nome vlido.');
           }
         }
         return;
@@ -1575,7 +1685,7 @@ client.on('interactionCreate', async (interaction) => {
         if (texto) {
           const sanitized = sanitizeTableName(texto);
           if (!sanitized) {
-            await respondEphemeral(interaction, 'Nome invlido. Use apenas letras, nmeros e underline.');
+            await respondEphemeral(interaction, 'Nome inválido. Use apenas letras, nmeros e underline.');
             return;
           }
           try {
@@ -1585,7 +1695,7 @@ client.on('interactionCreate', async (interaction) => {
             await respondEphemeral(interaction, `Tabela "${sanitized}" criada/confirmada.`);
           } catch (error) {
             console.error('Erro criando tabela no SQLite', error);
-            await respondEphemeral(interaction, 'No foi possvel criar a tabela no banco de dados.');
+            await respondEphemeral(interaction, 'Não foi possível criar a tabela no banco de dados.');
           }
         }
         return;
@@ -1595,7 +1705,7 @@ client.on('interactionCreate', async (interaction) => {
         const { tableKey, stock } = await resolveSessionTableStock(session);
         const embed = buildVendaEmbed(session, stock);
         const menu = buildProductSelectRow(session.products);
-        await respondEphemeral(interaction, 'Painel pronto! Est sendo publicado.');
+        await respondEphemeral(interaction, 'Painel pronto! Está sendo publicado.');
         const sent = await interaction.channel.send({
           embeds: [embed],
           components: menu ? [menu] : [],
@@ -1632,12 +1742,12 @@ client.on('interactionCreate', async (interaction) => {
         const metadata = panelMetadata?.entry?.session;
         const tableName = panelMetadata?.tableName;
         if (!tableName) {
-          await respondEphemeral(interaction, 'Produto no est vinculado a uma tabela, contate a equipe.');
+          await respondEphemeral(interaction, 'Produto no está vinculado a uma tabela, contate a equipe.');
           return;
         }
         const stock = await getStockCount(tableName);
         if (stock <= 0) {
-          await respondEphemeral(interaction, 'Estoque indisponvel no momento.');
+          await respondEphemeral(interaction, 'Estoque indisponível no momento.');
           return;
         }
         const priceLabel = metadata?.price || '';
@@ -1730,13 +1840,13 @@ client.on('interactionCreate', async (interaction) => {
 
       const member = interaction.member;
       if (!member?.roles.cache.has(COMMAND_ROLE_ID)) {
-        await respondEphemeral(interaction, `Voc precisa do cargo <@&${COMMAND_ROLE_ID}> para configurar o painel.`);
+        await respondEphemeral(interaction, `Você precisa do cargo <@&${COMMAND_ROLE_ID}> para configurar o painel.`);
         return;
       }
 
       const session = buttonSaleSessions.get(interaction.user.id);
       if (!session) {
-        await respondEphemeral(interaction, 'Nenhuma sesso encontrada. Inicie o comando novamente.');
+        await respondEphemeral(interaction, 'Nenhuma sessão encontrada. Inicie o comando novamente.');
         return;
       }
 
@@ -1746,21 +1856,21 @@ client.on('interactionCreate', async (interaction) => {
       };
 
       if (action === 'title') {
-        const texto = await promptForValue('Defina o ttulo do painel.');
+        const texto = await promptForValue('Defina o título do painel.');
         if (texto) {
           session.title = texto;
           buttonSaleSessions.set(interaction.user.id, session);
-          await respondEphemeral(interaction, 'Ttulo atualizado.');
+          await respondEphemeral(interaction, 'Título atualizado.');
         }
         return;
       }
 
       if (action === 'description') {
-        const texto = await promptForValue('Defina a descrio do painel.');
+        const texto = await promptForValue('Defina a descrição do painel.');
         if (texto) {
           session.description = texto;
           buttonSaleSessions.set(interaction.user.id, session);
-          await respondEphemeral(interaction, 'Descrio atualizada.');
+          await respondEphemeral(interaction, 'Descrição atualizada.');
         }
         return;
       }
@@ -1782,17 +1892,17 @@ client.on('interactionCreate', async (interaction) => {
       }
 
       if (action === 'price') {
-        const texto = await promptForValue('Informe o preo que ser exibido (ex: R$ 120).');
+        const texto = await promptForValue('Informe o preço que ser exibido (ex: R$ 120).');
         if (texto) {
           session.price = texto;
           buttonSaleSessions.set(interaction.user.id, session);
-          await respondEphemeral(interaction, 'Preo atualizado.');
+          await respondEphemeral(interaction, 'Preço atualizado.');
         }
         return;
       }
 
       if (action === 'color') {
-        const texto = await promptForValue('Informe um cdigo de cor em hexadecimal (ex: #ff8800) ou nome.');
+        const texto = await promptForValue('Informe um código de cor em hexadecimal (ex: #ff8800) ou nome.');
         if (texto) {
           const color = normalizeColor(texto);
           if (color) {
@@ -1800,7 +1910,7 @@ client.on('interactionCreate', async (interaction) => {
             buttonSaleSessions.set(interaction.user.id, session);
             await respondEphemeral(interaction, 'Cor atualizada.');
           } else {
-            await respondEphemeral(interaction, 'Cor invlida. Use #rrggbb ou um nome vlido.');
+            await respondEphemeral(interaction, 'Cor inválida. Use #rrggbb ou um nome vlido.');
           }
         }
         return;
@@ -1811,7 +1921,7 @@ client.on('interactionCreate', async (interaction) => {
         if (texto) {
           const sanitized = sanitizeTableName(texto);
           if (!sanitized) {
-            await respondEphemeral(interaction, 'Nome invlido. Use apenas letras, nmeros e underline.');
+            await respondEphemeral(interaction, 'Nome inválido. Use apenas letras, nmeros e underline.');
             return;
           }
           try {
@@ -1821,7 +1931,7 @@ client.on('interactionCreate', async (interaction) => {
             await respondEphemeral(interaction, `Tabela "${sanitized}" criada/confirmada.`);
           } catch (error) {
             console.error('Erro criando tabela no SQLite', error);
-            await respondEphemeral(interaction, 'No foi possvel criar a tabela no banco de dados.');
+            await respondEphemeral(interaction, 'Não foi possvel criar a tabela no banco de dados.');
           }
         }
         return;
@@ -1831,7 +1941,7 @@ client.on('interactionCreate', async (interaction) => {
         const { tableKey, stock } = await resolveSessionTableStock(session);
         const embed = buildVendaEmbed(session, stock);
         const row = createVendaBuyButtonRow();
-        await respondEphemeral(interaction, 'Painel pronto! Est sendo publicado.');
+        await respondEphemeral(interaction, 'Painel pronto! Está sendo publicado.');
         const sent = await interaction.channel.send({
           embeds: [embed],
           components: [row],
@@ -1862,7 +1972,7 @@ client.on('interactionCreate', async (interaction) => {
       const action = interaction.customId.split(':')[1];
       const state = orderSessions.get(interaction.channelId);
       if (!state) {
-        await respondEphemeral(interaction, 'Sesso de pedido encerrada ou invlida.');
+        await respondEphemeral(interaction, 'sessão de pedido encerrada ou invlida.');
         return;
       }
       const stock = await getStockCount(state.tableName);
@@ -1874,7 +1984,7 @@ client.on('interactionCreate', async (interaction) => {
           return;
         }
         if (state.quantity >= stock) {
-          await respondEphemeral(interaction, 'Quantidade j atingiu o limite do estoque.');
+          await respondEphemeral(interaction, 'Quantidade já atingiu o limite do estoque.');
           return;
         }
         state.quantity += 1;
@@ -1981,12 +2091,13 @@ client.on('interactionCreate', async (interaction) => {
           }
           state.paymentReference = reference;
           state.paymentProcessed = false;
-          paymentReferences.set(reference, { state, processed: false });
+          setPendingPayment(reference, state);
           orderSessions.set(interaction.channelId, state);
+          console.log(`[MP PIX] pendência registrada para ${reference}.`);
           await respondEphemeral(interaction, 'PIX gerado! O QR Code e o cdigo aparecem abaixo.');
         } catch (error) {
           console.error('Erro ao gerar PIX', error);
-          await respondEphemeral(interaction, `No foi possvel gerar o PIX. ${error.message || ''}`.trim());
+          await respondEphemeral(interaction, `No foi possível gerar o PIX. ${error.message || ''}`.trim());
         }
         return;
       }
@@ -1994,10 +2105,10 @@ client.on('interactionCreate', async (interaction) => {
       if (action === 'copy_pix') {
         const pixCode = state.pixData?.qrCode;
         if (!pixCode) {
-          await respondEphemeral(interaction, 'Ainda no h PIX gerado para copiar.');
+          await respondEphemeral(interaction, 'Ainda não há PIX gerado para copiar.');
           return;
         }
-        await respondEphemeral(interaction, `Cdigo PIX:\n\`\`\`${pixCode}\`\`\``);
+        await respondEphemeral(interaction, `Código PIX:\n\`\`\`${pixCode}\`\`\``);
         return;
       }
 
@@ -2030,7 +2141,7 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.customId.startsWith('stock:')) {
       const member = interaction.member;
       if (!member?.roles.cache.has(COMMAND_ROLE_ID)) {
-        await respondEphemeral(interaction, `Voc precisa do cargo <@&${COMMAND_ROLE_ID}> para mexer no estoque.`);
+        await respondEphemeral(interaction, `Você precisa do cargo <@&${COMMAND_ROLE_ID}> para mexer no estoque.`);
         return;
       }
 
@@ -2039,7 +2150,7 @@ client.on('interactionCreate', async (interaction) => {
       const tableName = parts.slice(2).join(':');
       const sanitizedName = sanitizeTableName(tableName);
       if (!sanitizedName) {
-        await respondEphemeral(interaction, 'Nome de tabela invlido.');
+        await respondEphemeral(interaction, 'Nome de tabela inválido.');
         return;
       }
 
@@ -2054,7 +2165,7 @@ client.on('interactionCreate', async (interaction) => {
           .map((item) => item.trim())
           .filter(Boolean);
         if (!valores.length) {
-          await respondEphemeral(interaction, 'Nenhum valor vlido informado.');
+          await respondEphemeral(interaction, 'Nenhum valor válido informado.');
           return;
         }
         try {
@@ -2066,17 +2177,17 @@ client.on('interactionCreate', async (interaction) => {
           await respondEphemeral(interaction, `Adicionados ${valores.length} itens. Estoque agora: ${total}.`);
         } catch (error) {
           console.error('Erro ao adicionar estoque', error);
-          await respondEphemeral(interaction, 'No foi possvel adicionar o estoque.');
+          await respondEphemeral(interaction, 'No foi possível adicionar o estoque.');
         }
         return;
       }
 
       if (action === 'price') {
-        const resposta = await awaitUserResponse(interaction, 'Informe o preo exibido no painel (ex: R$ 120).');
+        const resposta = await awaitUserResponse(interaction, 'Informe o preço exibido no painel (ex: R$ 120).');
         if (!resposta) return;
         const valor = resposta.content?.trim();
         if (!valor) {
-          await respondEphemeral(interaction, 'Informe um preo vlido.');
+          await respondEphemeral(interaction, 'Informe um preço válido.');
           return;
         }
         priceOverrides.set(sanitizedName, valor);
@@ -2088,10 +2199,10 @@ client.on('interactionCreate', async (interaction) => {
           const total = await getStockCount(sanitizedName);
           await refreshPanelEmbed(sanitizedName);
           await updateStockMessage(interaction.channel, sanitizedName, total, valor);
-          await respondEphemeral(interaction, `Preo atualizado para ${valor}. Estoque atual: ${total}.`);
+          await respondEphemeral(interaction, `Preço atualizado para ${valor}. Estoque atual: ${total}.`);
         } catch (error) {
-          console.error('Erro ao atualizar preo', error);
-          await respondEphemeral(interaction, 'No foi possvel atualizar o preo.');
+          console.error('Erro ao atualizar preço', error);
+          await respondEphemeral(interaction, 'No foi possível atualizar o preço.');
         }
         return;
       }
@@ -2105,7 +2216,7 @@ client.on('interactionCreate', async (interaction) => {
           await respondEphemeral(interaction, 'Estoque limpo com sucesso.');
         } catch (error) {
           console.error('Erro ao limpar estoque', error);
-          await respondEphemeral(interaction, 'No foi possvel limpar o estoque.');
+          await respondEphemeral(interaction, 'Não foi possvel limpar o estoque.');
         }
         return;
       }
@@ -2119,15 +2230,15 @@ client.on('interactionCreate', async (interaction) => {
           cleanupMetadataForTable(sanitizedName);
           const dropEmbed = new EmbedBuilder()
             .setTitle('Tabela removida')
-            .setDescription(`A tabela **${sanitizedName}** foi excluda do banco de dados.`)
+            .setDescription(`A tabela **${sanitizedName}** foi excluída do banco de dados.`)
             .setColor('Red');
           if (interaction.message?.edit) {
             await interaction.message.edit({ embeds: [dropEmbed], components: [] });
           }
-          await respondEphemeral(interaction, 'Tabela excluda. O estoque foi zerado e a tabela removida.');
+          await respondEphemeral(interaction, 'Tabela excluída. O estoque foi zerado e a tabela removida.');
         } catch (error) {
           console.error('Erro ao excluir tabela', error);
-          await respondEphemeral(interaction, 'No foi possvel excluir a tabela.');
+          await respondEphemeral(interaction, 'Não foi possível excluir a tabela.');
         }
         return;
       }
@@ -2140,7 +2251,7 @@ client.on('interactionCreate', async (interaction) => {
       }
 
       if (!interaction.channel || interaction.channel.type !== ChannelType.GuildText) {
-        await respondEphemeral(interaction, 'Canal invlido.');
+        await respondEphemeral(interaction, 'Canal inválido.');
         return;
       }
 
@@ -2156,7 +2267,7 @@ client.on('interactionCreate', async (interaction) => {
           embeds: [
             new EmbedBuilder()
               .setTitle('Ticket fechado')
-              .setDescription('Ningum mais pode enviar mensagens nesta conversa at que um autorizado reabra.')
+              .setDescription('Ninguém mais pode enviar mensagens nesta conversa at que um autorizado reabra.')
               .setColor('Red')
           ]
         });
@@ -2177,7 +2288,7 @@ client.on('interactionCreate', async (interaction) => {
         await respondEphemeral(interaction, 'Excluindo o canal...');
         const deletedName = interaction.channel.name;
         const deletedId = interaction.channel.id;
-        await interaction.channel.delete('Ticket excludo via boto');
+        await interaction.channel.delete('Ticket excluído via boto');
         await sendWebhookNotification(WEBHOOKS.delete, {
           title: 'Excluiu ticket',
           description: `${interaction.user.tag} excluiu ${deletedName}`,
@@ -2195,7 +2306,7 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.customId.startsWith('ticket:')) {
       const member = interaction.member;
       if (!member?.roles.cache.has(COMMAND_ROLE_ID)) {
-        await respondEphemeral(interaction, `Voc precisa do cargo <@&${COMMAND_ROLE_ID}> para manipular tickets.`);
+        await respondEphemeral(interaction, `Você precisa do cargo <@&${COMMAND_ROLE_ID}> para manipular tickets.`);
         return;
       }
 
@@ -2216,11 +2327,11 @@ client.on('interactionCreate', async (interaction) => {
       }
 
       const promptMap = {
-        title: 'Qual ser o ttulo do ticket?',
-        description: 'Escreva uma descrio para o ticket.',
+        title: 'Qual ser o título do ticket?',
+        description: 'Escreva uma descrição para o ticket.',
         image: 'Cole uma URL de imagem ou envie um arquivo (digite "remover" para limpar).',
         supports: 'Liste os nomes das opes de suporte separados por vrgula.',
-        color: 'Informe um cdigo hexadecimal (ex: #ff8800) ou um nome de cor.'
+        color: 'Informe um código hexadecimal (ex: #ff8800) ou um nome de cor.'
       };
 
       if (!promptMap[action]) {
@@ -2252,7 +2363,7 @@ client.on('interactionCreate', async (interaction) => {
         }
       } else if (action === 'color') {
         if (!textoResposta) {
-          await respondEphemeral(interaction, 'Informe um texto vlido.');
+          await respondEphemeral(interaction, 'Informe um texto válido.');
           return;
         }
         session.color = normalizeColor(textoResposta) || session.color;
@@ -2266,7 +2377,7 @@ client.on('interactionCreate', async (interaction) => {
   } catch (error) {
     console.error('Erro ao processar interao', error);
     if (!interaction.replied && !interaction.deferred) {
-      await respondEphemeral(interaction, 'Ocorreu um erro ao processar a interao.');
+      await respondEphemeral(interaction, 'Ocorreu um erro ao processar a interação.');
     }
   }
 });
