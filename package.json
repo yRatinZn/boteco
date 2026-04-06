@@ -1,0 +1,16 @@
+{
+  "name": "discord-painel-bot",
+  "version": "0.1.0",
+  "description": "Base Discord slash-command bot with a /painel placeholder.",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/index.js",
+    "register": "node src/register-commands.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.10.0",
+    "dotenv": "^16.3.1",
+    "sqlite3": "^5.1.4"
+  }
+}
